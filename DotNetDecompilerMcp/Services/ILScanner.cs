@@ -18,7 +18,9 @@ internal static class ILScanner
         // ldfld, ldflda, stfld, ldsfld, ldsflda, stsfld
         0x7B or 0x7C or 0x7D or 0x7E or 0x7F or 0x80 or
         // newarr, ldelema, sizeof, ldtoken
-        0x8D or 0xA3 or 0x8C or 0xD0 => true,
+        0x8D or 0xA3 or 0x8C or 0xD0 or
+        // ldstr (UserString token 0x70xxxxxx)
+        0x72 => true,
         _ => false,
     };
 

@@ -25,7 +25,7 @@ public sealed class IndexTools(DecompilerService svc, DatabaseService db)
             var absPath = Path.GetFullPath(assemblyPath);
             var cached  = svc.LoadAssembly(absPath);
             var sw      = System.Diagnostics.Stopwatch.StartNew();
-            var (types, members, refs) = db.IndexAssembly(absPath, cached);
+            var (types, members, refs, strings) = db.IndexAssembly(absPath, cached);
             sw.Stop();
 
             return JsonSerializer.Serialize(new
@@ -35,8 +35,9 @@ public sealed class IndexTools(DecompilerService svc, DatabaseService db)
                 types,
                 members,
                 refs,
+                strings,
                 elapsedMs   = sw.ElapsedMilliseconds,
-                message     = $"Indexed {types} types, {members} members, {refs} references in {sw.ElapsedMilliseconds} ms."
+                message     = $"Indexed {types} types, {members} members, {refs} references, {strings} string literals in {sw.ElapsedMilliseconds} ms."
             });
         }
         catch (Exception ex)

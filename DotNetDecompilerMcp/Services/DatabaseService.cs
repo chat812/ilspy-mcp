@@ -8,6 +8,8 @@ namespace DotNetDecompilerMcp.Services;
 public record TypeRecord(string Namespace, string Name, string FullName, string Kind);
 public record MemberRecord(string TypeName, string MemberType, string Name, string Signature, string Access, bool IsStatic);
 public record ReferenceRecord(string ContainingType, string Method);
+public record StringRecord(string TypeName, string MethodName, string Value);
+public record CalleeRecord(string TargetType, string? TargetMember);
 
 public sealed class DatabaseService : IDisposable
 {
@@ -80,6 +82,17 @@ public sealed class DatabaseService : IDisposable
             );
             CREATE INDEX IF NOT EXISTS idx_refs_target        ON refs(assembly_id, target_type);
             CREATE INDEX IF NOT EXISTS idx_refs_target_member ON refs(assembly_id, target_type, target_member);
+            CREATE INDEX IF NOT EXISTS idx_refs_caller        ON refs(assembly_id, caller_type, caller_method);
+
+            CREATE TABLE IF NOT EXISTS strings (
+                id          INTEGER PRIMARY KEY,
+                assembly_id INTEGER NOT NULL,
+                type_name   TEXT    NOT NULL,
+                method_name TEXT    NOT NULL,
+                value       TEXT    NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_strings_assembly ON strings(assembly_id);
+            CREATE INDEX IF NOT EXISTS idx_strings_value    ON strings(value COLLATE NOCASE);
             """;
         cmd.ExecuteNonQuery();
     }
@@ -101,11 +114,11 @@ public sealed class DatabaseService : IDisposable
     public bool EnsureIndexed(string assemblyPath, CachedAssembly cached)
     {
         if (IsUpToDate(assemblyPath)) return false;
-        IndexAssembly(assemblyPath, cached);
+        _ = IndexAssembly(assemblyPath, cached);
         return true;
     }
 
-    public (int types, int members, int refs) IndexAssembly(string assemblyPath, CachedAssembly cached)
+    public (int types, int members, int refs, int strings) IndexAssembly(string assemblyPath, CachedAssembly cached)
     {
         var meta = cached.PEFile.Metadata;
         var ts   = cached.TypeSystem;
@@ -124,6 +137,7 @@ public sealed class DatabaseService : IDisposable
         long asmId;
         {
             using var del = Cmd(conn, tx,
+                "DELETE FROM strings WHERE assembly_id = (SELECT id FROM assemblies WHERE path = @p);" +
                 "DELETE FROM refs    WHERE assembly_id = (SELECT id FROM assemblies WHERE path = @p);" +
                 "DELETE FROM members WHERE assembly_id = (SELECT id FROM assemblies WHERE path = @p);" +
                 "DELETE FROM types   WHERE assembly_id = (SELECT id FROM assemblies WHERE path = @p);" +
@@ -220,8 +234,11 @@ public sealed class DatabaseService : IDisposable
         // ── References (IL scan) ─────────────────────────────────────────────
         int refCount = IndexRefs(conn, tx, asmId, cached, meta);
 
+        // ── String literals (IL scan) ────────────────────────────────────────
+        int stringCount = IndexStrings(conn, tx, asmId, cached, meta);
+
         tx.Commit();
-        return (typeCount, memberCount, refCount);
+        return (typeCount, memberCount, refCount, stringCount);
     }
 
     // ── Query methods ─────────────────────────────────────────────────────────
@@ -348,6 +365,67 @@ public sealed class DatabaseService : IDisposable
         return list;
     }
 
+    public List<CalleeRecord> GetCallees(string assemblyPath, string callerType, string callerMethod)
+    {
+        using var conn = Open();
+        var asmId = AssemblyId(conn, assemblyPath);
+        if (asmId == null) return [];
+        using var cmd = Cmd(conn, null, """
+            SELECT DISTINCT target_type, target_member
+            FROM refs
+            WHERE assembly_id = @a AND caller_type = @ct AND caller_method = @cm
+            ORDER BY target_type, target_member
+            """);
+        cmd.Parameters.AddWithValue("@a",  asmId);
+        cmd.Parameters.AddWithValue("@ct", callerType);
+        cmd.Parameters.AddWithValue("@cm", callerMethod);
+        var list = new List<CalleeRecord>();
+        using var r = cmd.ExecuteReader();
+        while (r.Read())
+            list.Add(new(r.GetString(0), r.IsDBNull(1) ? null : r.GetString(1)));
+        return list;
+    }
+
+    public List<StringRecord> SearchStrings(string assemblyPath, string query, int max)
+    {
+        using var conn = Open();
+        var asmId = AssemblyId(conn, assemblyPath);
+        if (asmId == null) return [];
+        using var cmd = Cmd(conn, null, """
+            SELECT type_name, method_name, value
+            FROM strings
+            WHERE assembly_id = @a AND value LIKE @q ESCAPE '\'
+            ORDER BY type_name, method_name LIMIT @max
+            """);
+        cmd.Parameters.AddWithValue("@a",   asmId);
+        cmd.Parameters.AddWithValue("@q",   "%" + Like(query) + "%");
+        cmd.Parameters.AddWithValue("@max", max);
+        var list = new List<StringRecord>();
+        using var r = cmd.ExecuteReader();
+        while (r.Read())
+            list.Add(new(r.GetString(0), r.GetString(1), r.GetString(2)));
+        return list;
+    }
+
+    public List<MemberRecord> SearchMethods(string assemblyPath, string query, string? typeName, int max)
+    {
+        using var conn = Open();
+        var asmId = AssemblyId(conn, assemblyPath);
+        if (asmId == null) return [];
+        var typeClause = typeName != null ? "AND t.full_name LIKE @tn ESCAPE '\\'" : "";
+        using var cmd = Cmd(conn, null, $"""
+            SELECT t.full_name, m.member_type, m.name, m.signature, m.access, m.is_static
+            FROM members m JOIN types t ON t.id = m.type_id
+            WHERE m.assembly_id = @a AND m.member_type = 'method' AND m.name LIKE @q ESCAPE '\' {typeClause}
+            ORDER BY t.full_name, m.name LIMIT @max
+            """);
+        cmd.Parameters.AddWithValue("@a",   asmId);
+        cmd.Parameters.AddWithValue("@q",   "%" + Like(query) + "%");
+        cmd.Parameters.AddWithValue("@max", max);
+        if (typeName != null) cmd.Parameters.AddWithValue("@tn", "%" + Like(typeName) + "%");
+        return ReadMembers(cmd);
+    }
+
     // ── IL reference indexer ──────────────────────────────────────────────────
 
     private static int IndexRefs(
@@ -470,6 +548,87 @@ public sealed class DatabaseService : IDisposable
         }
 
         return refCount;
+    }
+
+    // ── IL string literal indexer ─────────────────────────────────────────────
+
+    private static int IndexStrings(
+        SqliteConnection conn, SqliteTransaction tx,
+        long asmId, CachedAssembly cached, MetadataReader meta)
+    {
+        int count = 0;
+        var seen = new HashSet<(string, string, string)>();
+
+        foreach (var tdHandle in meta.TypeDefinitions)
+        {
+            var td       = meta.GetTypeDefinition(tdHandle);
+            var ns       = meta.GetString(td.Namespace);
+            var typeName = meta.GetString(td.Name);
+            if (typeName.Contains('<') || typeName.Contains('>')) continue;
+            var callerType = string.IsNullOrEmpty(ns) ? typeName : $"{ns}.{typeName}";
+
+            foreach (var mhHandle in td.GetMethods())
+            {
+                var methodDef  = meta.GetMethodDefinition(mhHandle);
+                var methodName = meta.GetString(methodDef.Name);
+                if (methodName.Contains('<') || methodName.Contains('>')) continue;
+                if (methodDef.RelativeVirtualAddress == 0) continue;
+
+                try
+                {
+                    var body     = cached.PEFile.Reader.GetMethodBody(methodDef.RelativeVirtualAddress);
+                    var ilReader = body.GetILReader();
+
+                    while (ilReader.RemainingBytes > 0)
+                    {
+                        var op = ilReader.ReadByte();
+
+                        if (op == 0xFE) // two-byte prefix — skip second byte
+                        {
+                            if (ilReader.RemainingBytes >= 1) ilReader.ReadByte();
+                            continue;
+                        }
+
+                        if (op == 0x72 && ilReader.RemainingBytes >= 4) // ldstr
+                        {
+                            var tok = ilReader.ReadInt32();
+                            if (((uint)tok >> 24) == 0x70) // UserString token
+                            {
+                                try
+                                {
+                                    var str = meta.GetUserString(System.Reflection.Metadata.Ecma335.MetadataTokens.UserStringHandle(tok));
+                                    if (!string.IsNullOrEmpty(str) && seen.Add((callerType, methodName, str)))
+                                    {
+                                        using var ins = Cmd(conn, tx, """
+                                            INSERT INTO strings (assembly_id, type_name, method_name, value)
+                                            VALUES (@a, @t, @m, @v)
+                                            """);
+                                        ins.Parameters.AddWithValue("@a", asmId);
+                                        ins.Parameters.AddWithValue("@t", callerType);
+                                        ins.Parameters.AddWithValue("@m", methodName);
+                                        ins.Parameters.AddWithValue("@v", str);
+                                        ins.ExecuteNonQuery();
+                                        count++;
+                                    }
+                                }
+                                catch { }
+                            }
+                        }
+                        else if (ILScanner.HasTokenOperand(op) && ilReader.RemainingBytes >= 4)
+                        {
+                            ilReader.ReadInt32();
+                        }
+                        else
+                        {
+                            ILScanner.SkipOperand(ref ilReader, op);
+                        }
+                    }
+                }
+                catch { }
+            }
+        }
+
+        return count;
     }
 
     // ── Helpers ───────────────────────────────────────────────────────────────

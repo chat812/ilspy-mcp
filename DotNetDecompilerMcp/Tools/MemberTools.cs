@@ -1,4 +1,5 @@
 using System.ComponentModel;
+using System.Reflection.Metadata;
 using System.Text.Json;
 using ICSharpCode.Decompiler.TypeSystem;
 using ModelContextProtocol.Server;
@@ -122,6 +123,244 @@ public sealed class MemberTools(DecompilerService svc, DatabaseService db)
         {
             return Error(ex.Message);
         }
+    }
+
+    /// <summary>
+    /// Get detailed signatures for all (or a specific) method(s) on a type:
+    /// parameter names/types, return type, generic type parameters, and modifier flags.
+    /// </summary>
+    [McpServerTool(Name = "get_method_signatures")]
+    [Description("Get detailed method signatures for a type: parameters, return type, generic params, flags. Leave methodName empty to list all methods.")]
+    public string GetMethodSignatures(
+        [Description("Path to the .NET assembly.")] string assemblyPath,
+        [Description("Fully-qualified type name.")] string typeName,
+        [Description("Method name to query. Leave empty to return all methods on the type.")] string methodName = "")
+    {
+        try
+        {
+            var cached = svc.LoadAssembly(assemblyPath);
+            var typeDef = svc.FindType(cached, typeName);
+            if (typeDef == null)
+                return Error($"Type '{typeName}' not found.");
+
+            var methods = string.IsNullOrEmpty(methodName)
+                ? typeDef.Methods.Where(m => !m.Name.Contains('<')).ToList()
+                : typeDef.Methods.Where(m =>
+                    string.Equals(m.Name, methodName, StringComparison.OrdinalIgnoreCase) &&
+                    !m.Name.Contains('<')).ToList();
+
+            if (methods.Count == 0 && !string.IsNullOrEmpty(methodName))
+                return Error($"Method '{methodName}' not found on '{typeName}'.");
+
+            var result = methods.Select(m => new
+            {
+                name           = m.Name,
+                returnType     = m.ReturnType.FullName,
+                parameters     = m.Parameters.Select(p => new
+                {
+                    name       = p.Name,
+                    type       = p.Type.FullName,
+                    isOptional = p.IsOptional,
+                    isParams   = p.IsParams,
+                }).ToList(),
+                typeParameters = m.TypeParameters.Select(tp => tp.Name).ToList(),
+                accessibility  = m.Accessibility.ToString().ToLowerInvariant(),
+                isStatic       = m.IsStatic,
+                isVirtual      = m.IsVirtual,
+                isAbstract     = m.IsAbstract,
+                isOverride     = m.IsOverride,
+                isSealed       = m.IsSealed,
+                isConstructor  = m.IsConstructor,
+                hasBody        = m.HasBody,
+            }).ToList<object>();
+
+            return JsonSerializer.Serialize(new
+            {
+                success     = true,
+                typeName,
+                methodCount = result.Count,
+                methods     = result
+            });
+        }
+        catch (Exception ex) { return Error(ex.Message); }
+    }
+
+    /// <summary>
+    /// Get raw method body information: MaxStack, InitLocals, IL byte count,
+    /// local variable count, and exception handler regions.
+    /// </summary>
+    [McpServerTool(Name = "get_method_body")]
+    [Description("Get method body details: MaxStack, InitLocals, IL byte count, local count, exception handlers.")]
+    public string GetMethodBody(
+        [Description("Path to the .NET assembly.")] string assemblyPath,
+        [Description("Fully-qualified type name.")] string typeName,
+        [Description("Method name.")] string methodName,
+        [Description("Optional parameter types for overload resolution.")] string[]? parameterTypes = null)
+    {
+        try
+        {
+            var cached = svc.LoadAssembly(assemblyPath);
+            var typeDef = svc.FindType(cached, typeName);
+            if (typeDef == null)
+                return Error($"Type '{typeName}' not found.");
+
+            var method = svc.FindMethod(typeDef, methodName, parameterTypes);
+            if (method == null)
+                return Error($"Method '{methodName}' not found on '{typeName}'.");
+
+            var meta   = cached.PEFile.Metadata;
+            var handle = (MethodDefinitionHandle)method.MetadataToken;
+            var md     = meta.GetMethodDefinition(handle);
+
+            if (md.RelativeVirtualAddress == 0)
+                return JsonSerializer.Serialize(new
+                {
+                    success    = true,
+                    typeName,
+                    methodName = method.Name,
+                    hasBody    = false
+                });
+
+            var body    = cached.PEFile.Reader.GetMethodBody(md.RelativeVirtualAddress);
+            var ilBytes = body.GetILReader().Length;
+
+            // Decode local variable count from the LocalVarSig blob
+            int localCount = 0;
+            if (!body.LocalSignature.IsNil)
+            {
+                try
+                {
+                    var sig    = meta.GetStandaloneSignature(body.LocalSignature);
+                    var reader = meta.GetBlobReader(sig.Signature);
+                    if (reader.RemainingBytes > 0 && reader.ReadByte() == 0x07) // LOCAL_SIG
+                        localCount = reader.ReadCompressedInteger();
+                }
+                catch { }
+            }
+
+            var exHandlers = body.ExceptionRegions.Select(r => new
+            {
+                kind          = r.Kind.ToString(),
+                tryOffset     = r.TryOffset,
+                tryLength     = r.TryLength,
+                handlerOffset = r.HandlerOffset,
+                handlerLength = r.HandlerLength,
+            }).ToList();
+
+            return JsonSerializer.Serialize(new
+            {
+                success               = true,
+                typeName,
+                methodName            = method.Name,
+                hasBody               = true,
+                maxStack              = body.MaxStack,
+                initLocals            = body.LocalVariablesInitialized,
+                localCount,
+                ilByteCount           = ilBytes,
+                exceptionHandlerCount = exHandlers.Count,
+                exceptionHandlers     = exHandlers,
+            });
+        }
+        catch (Exception ex) { return Error(ex.Message); }
+    }
+
+    /// <summary>
+    /// Get the IL disassembly as a structured list of opcodes with their byte offsets.
+    /// More machine-friendly than get_il's plain text output.
+    /// </summary>
+    [McpServerTool(Name = "get_il_opcodes_formatted")]
+    [Description("Get IL as a structured list: [{offset, opcode, operand}]. Use parameterTypes for overload resolution.")]
+    public string GetILOpcodesFormatted(
+        [Description("Path to the .NET assembly.")] string assemblyPath,
+        [Description("Fully-qualified type name.")] string typeName,
+        [Description("Method name.")] string methodName,
+        [Description("Optional parameter types for overload resolution.")] string[]? parameterTypes = null)
+    {
+        try
+        {
+            var cached = svc.LoadAssembly(assemblyPath);
+            var typeDef = svc.FindType(cached, typeName);
+            if (typeDef == null)
+                return Error($"Type '{typeName}' not found.");
+
+            var method = svc.FindMethod(typeDef, methodName, parameterTypes);
+            if (method == null)
+                return Error($"Method '{methodName}' not found on '{typeName}'.");
+
+            // Use the text disassembler output and parse it into structured form
+            var ilText = svc.GetIL(cached, method);
+            var opcodes = new List<object>();
+
+            foreach (var line in ilText.Split('\n'))
+            {
+                var trimmed = line.Trim();
+                if (!trimmed.StartsWith("IL_")) continue;
+
+                var colonIdx = trimmed.IndexOf(':');
+                if (colonIdx < 0) continue;
+
+                var offsetStr = trimmed[3..colonIdx];
+                if (!int.TryParse(offsetStr, System.Globalization.NumberStyles.HexNumber, null, out var offset))
+                    continue;
+
+                var rest     = trimmed[(colonIdx + 1)..].Trim();
+                var spaceIdx = rest.IndexOf(' ');
+                var opcode   = spaceIdx < 0 ? rest : rest[..spaceIdx];
+                var operand  = spaceIdx < 0 ? null : rest[(spaceIdx + 1)..].Trim();
+                if (string.IsNullOrEmpty(operand)) operand = null;
+
+                opcodes.Add(new { offset, opcode, operand });
+            }
+
+            return JsonSerializer.Serialize(new
+            {
+                success    = true,
+                typeName,
+                methodName = method.Name,
+                count      = opcodes.Count,
+                opcodes,
+            });
+        }
+        catch (Exception ex) { return Error(ex.Message); }
+    }
+
+    /// <summary>
+    /// Find all methods and fields called by a specific method. Results come from
+    /// the pre-built IL reference index populated during load_assembly/index_assembly.
+    /// This is the inverse of find_references.
+    /// </summary>
+    [McpServerTool(Name = "get_callees")]
+    [Description("Find all methods and fields called by a specific method. Inverse of find_references. Uses the SQLite index.")]
+    public string GetCallees(
+        [Description("Path to the .NET assembly.")] string assemblyPath,
+        [Description("Fully-qualified type name.")] string typeName,
+        [Description("Method name.")] string methodName)
+    {
+        try
+        {
+            var absPath = Path.GetFullPath(assemblyPath);
+            var cached  = svc.LoadAssembly(absPath);
+            db.EnsureIndexed(absPath, cached);
+
+            var typeDef = svc.FindType(cached, typeName);
+            if (typeDef == null)
+                return Error($"Type '{typeName}' not found.");
+
+            var method = svc.FindMethod(typeDef, methodName, null);
+            if (method == null)
+                return Error($"Method '{methodName}' not found on '{typeName}'.");
+
+            var rows = db.GetCallees(absPath, typeDef.FullName, method.Name);
+            return JsonSerializer.Serialize(new
+            {
+                success     = true,
+                typeName    = typeDef.FullName,
+                methodName  = method.Name,
+                calleeCount = rows.Count,
+                callees     = rows.Select(c => new { targetType = c.TargetType, member = c.TargetMember }).ToList(),
+            });
+        }
+        catch (Exception ex) { return Error(ex.Message); }
     }
 
     private static string GetAccess(Accessibility a) => a switch

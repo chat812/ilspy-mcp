@@ -1,5 +1,6 @@
 using System.ComponentModel;
 using System.Reflection.Metadata;
+using System.Reflection.PortableExecutable;
 using System.Runtime.InteropServices;
 using System.Text.Json;
 using ICSharpCode.Decompiler.Metadata;
@@ -283,6 +284,103 @@ public sealed class AssemblyTools(DecompilerService svc, DatabaseService db)
         {
             return Error(ex.Message);
         }
+    }
+
+    /// <summary>
+    /// Decompile types in the assembly to C#. Limited to maxTypes (max 10) for performance.
+    /// Use namespaceFilter to scope to a specific namespace.
+    /// </summary>
+    [McpServerTool(Name = "decompile_assembly")]
+    [Description("Decompile types in the assembly to C#. Limited to 10 types per call. Use namespaceFilter to scope.")]
+    public string DecompileAssembly(
+        [Description("Path to the .NET assembly.")] string assemblyPath,
+        [Description("Optional namespace prefix to filter types.")] string? namespaceFilter = null,
+        [Description("Maximum number of types to decompile (default 10, max 10).")] int maxTypes = 10)
+    {
+        try
+        {
+            maxTypes = Math.Clamp(maxTypes, 1, 10);
+            var cached = svc.LoadAssembly(assemblyPath);
+            var types  = svc.EnumerateTypes(cached, namespaceFilter).Take(maxTypes).ToList();
+
+            var results = new List<object>();
+            foreach (var (ns, name, kind) in types)
+            {
+                var fullName = string.IsNullOrEmpty(ns) ? name : $"{ns}.{name}";
+                var typeDef  = svc.FindType(cached, fullName);
+                if (typeDef == null) continue;
+                var source = svc.DecompileType(cached, typeDef, 200);
+                results.Add(new { fullName, kind, source });
+            }
+
+            return JsonSerializer.Serialize(new
+            {
+                success          = true,
+                namespaceFilter,
+                totalDecompiled  = results.Count,
+                types            = results,
+            });
+        }
+        catch (Exception ex) { return Error(ex.Message); }
+    }
+
+    /// <summary>
+    /// Get PE file metadata: MVID, CLR runtime version, PE sections, image characteristics.
+    /// </summary>
+    [McpServerTool(Name = "get_metadata")]
+    [Description("Get PE metadata: MVID, CLR runtime version, PE sections, image base, architecture.")]
+    public string GetMetadata(
+        [Description("Path to the .NET assembly.")] string assemblyPath)
+    {
+        try
+        {
+            var cached  = svc.LoadAssembly(assemblyPath);
+            var pefile  = cached.PEFile;
+            var meta    = pefile.Metadata;
+            var headers = pefile.Reader.PEHeaders;
+
+            // MVID from module definition
+            var moduleDef = meta.GetModuleDefinition();
+            var mvid      = meta.GetGuid(moduleDef.Mvid).ToString("D").ToUpperInvariant();
+
+            // CLR runtime version
+            var corHeader      = headers.CorHeader;
+            var runtimeVersion = corHeader != null
+                ? $"{corHeader.MajorRuntimeVersion}.{corHeader.MinorRuntimeVersion}"
+                : "unknown";
+
+            // PE sections
+            var sections = headers.SectionHeaders.Select(s => new
+            {
+                name           = s.Name,
+                virtualAddress = s.VirtualAddress,
+                virtualSize    = s.VirtualSize,
+                rawDataOffset  = s.PointerToRawData,
+                rawDataSize    = s.SizeOfRawData,
+            }).ToList();
+
+            // Architecture and image properties
+            var coffHeader = headers.CoffHeader;
+            var peHeader   = headers.PEHeader;
+            var isDll      = coffHeader != null &&
+                             (coffHeader.Characteristics & Characteristics.Dll) != 0;
+            var is64Bit    = peHeader?.Magic == PEMagic.PE32Plus;
+
+            return JsonSerializer.Serialize(new
+            {
+                success        = true,
+                assemblyPath   = Path.GetFullPath(assemblyPath),
+                mvid,
+                runtimeVersion,
+                imageBase      = peHeader?.ImageBase,
+                subsystem      = peHeader?.Subsystem.ToString(),
+                isDll,
+                is64Bit,
+                sectionCount   = sections.Count,
+                sections,
+            });
+        }
+        catch (Exception ex) { return Error(ex.Message); }
     }
 
     private static bool IsUtf8Text(byte[] bytes)
