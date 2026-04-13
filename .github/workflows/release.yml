@@ -55,11 +55,11 @@ jobs:
 
       - name: Archive (Linux / macOS)
         if: runner.os != 'Windows'
-        run: tar -czf ${{ matrix.archive }} -C out ${{ matrix.artifact }}
+        run: tar -czf ${{ matrix.archive }} -C out .
 
       - name: Archive (Windows)
         if: runner.os == 'Windows'
-        run: Compress-Archive -Path out/${{ matrix.artifact }} -DestinationPath ${{ matrix.archive }}
+        run: Compress-Archive -Path out/* -DestinationPath ${{ matrix.archive }}
         shell: pwsh
 
       - name: Upload artifact
