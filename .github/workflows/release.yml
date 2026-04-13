@@ -1,0 +1,86 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build (${{ matrix.rid }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        include:
+          - rid: linux-x64
+            os: ubuntu-latest
+            artifact: DotNetDecompilerMcp
+            archive: ilspy-mcp-linux-x64.tar.gz
+          - rid: linux-arm64
+            os: ubuntu-latest
+            artifact: DotNetDecompilerMcp
+            archive: ilspy-mcp-linux-arm64.tar.gz
+          - rid: osx-x64
+            os: macos-latest
+            artifact: DotNetDecompilerMcp
+            archive: ilspy-mcp-osx-x64.tar.gz
+          - rid: osx-arm64
+            os: macos-latest
+            artifact: DotNetDecompilerMcp
+            archive: ilspy-mcp-osx-arm64.tar.gz
+          - rid: win-x64
+            os: windows-latest
+            artifact: DotNetDecompilerMcp.exe
+            archive: ilspy-mcp-win-x64.zip
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '8.0.x'
+
+      - name: Publish
+        run: >
+          dotnet publish DotNetDecompilerMcp/DotNetDecompilerMcp.csproj
+          -c Release
+          -r ${{ matrix.rid }}
+          --self-contained false
+          -o out
+          -p:UseAppHost=true
+
+      - name: Archive (Linux / macOS)
+        if: runner.os != 'Windows'
+        run: tar -czf ${{ matrix.archive }} -C out ${{ matrix.artifact }}
+
+      - name: Archive (Windows)
+        if: runner.os == 'Windows'
+        run: Compress-Archive -Path out/${{ matrix.artifact }} -DestinationPath ${{ matrix.archive }}
+        shell: pwsh
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.archive }}
+          path: ${{ matrix.archive }}
+
+  release:
+    name: Create Release
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: artifacts/*
+          generate_release_notes: true
